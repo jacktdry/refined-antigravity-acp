@@ -250,4 +250,73 @@ describe("dangling-tool-calls fix", () => {
     };
     expect(update2?.title).toBe("Check SigNoz pods status");
   });
+
+  it("assigns and preserves stable messageId across all agent_message_chunks in a turn", () => {
+    const fix = createToolCallCleanupFix();
+    const sessionId = "s1";
+
+    const chunk1 = makeMessageChunk(sessionId, "First part of table |");
+    const out1 = fix.onInbound!(chunk1, dummyContext) as AcpStreamMessage[];
+    expect(out1).toHaveLength(1);
+    const update1 = (out1[0] as unknown as { params?: SessionUpdateParams }).params?.update as {
+      messageId?: string;
+    };
+    expect(update1?.messageId).toMatch(/^msg_[a-f0-9-]+$/);
+    const assignedId = update1?.messageId;
+
+    // Second chunk in the same assistant turn must reuse the same messageId
+    const chunk2 = makeMessageChunk(sessionId, " Second part of table |");
+    const out2 = fix.onInbound!(chunk2, dummyContext) as AcpStreamMessage[];
+    expect(out2).toHaveLength(1);
+    const update2 = (out2[0] as unknown as { params?: SessionUpdateParams }).params?.update as {
+      messageId?: string;
+    };
+    expect(update2?.messageId).toBe(assignedId);
+
+    // On turn end, messageId is reset so next turn gets a new ID
+    fix.onTurnEnd!(sessionId, dummyContext);
+
+    const chunk3 = makeMessageChunk(sessionId, "New turn message");
+    const out3 = fix.onInbound!(chunk3, dummyContext) as AcpStreamMessage[];
+    expect(out3).toHaveLength(1);
+    const update3 = (out3[0] as unknown as { params?: SessionUpdateParams }).params?.update as {
+      messageId?: string;
+    };
+    expect(update3?.messageId).toMatch(/^msg_[a-f0-9-]+$/);
+    expect(update3?.messageId).not.toBe(assignedId);
+  });
+
+  it("does not flush dangling tool calls mid-stream during active text streaming", () => {
+    const fix = createToolCallCleanupFix();
+    const sessionId = "s1";
+
+    // 1. First chunk starts streaming
+    const chunk1 = makeMessageChunk(sessionId, "Row 1 | Row 2 |");
+    const out1 = fix.onInbound!(chunk1, dummyContext) as AcpStreamMessage[];
+    expect(out1).toHaveLength(1);
+
+    // 2. A background tool call arrives while streaming
+    fix.onInbound!(makeToolCallMessage(sessionId, "bg_tool", "in_progress"), dummyContext);
+
+    // 3. Next chunk arrives: must NOT inject synthetic tool completion mid-sentence
+    const chunk2 = makeMessageChunk(sessionId, "Row 3 | Row 4 |");
+    const out2 = fix.onInbound!(chunk2, dummyContext) as AcpStreamMessage[];
+    expect(out2).toHaveLength(1);
+    expect(out2[0]).toBe(chunk2);
+
+    // 4. On turn end, the dangling tool call is cleanly completed
+    const endMessages = fix.onTurnEnd!(sessionId, dummyContext);
+    expect(endMessages).toHaveLength(1);
+    expect(endMessages[0]).toMatchObject({
+      method: ACP_METHODS.SESSION_UPDATE,
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: SESSION_UPDATES.TOOL_CALL_UPDATE,
+          toolCallId: "bg_tool",
+          status: "completed",
+        },
+      },
+    });
+  });
 });

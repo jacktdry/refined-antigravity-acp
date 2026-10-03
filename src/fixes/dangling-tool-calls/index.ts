@@ -9,6 +9,7 @@
  * remaining dangling tool calls immediately upon assistant text streaming or turn completion.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   ACP_METHODS,
   SESSION_UPDATES,
@@ -55,6 +56,8 @@ function createToolCompletionMessage(sessionId: string, toolCallId: string): Acp
 export class ToolCallTracker {
   private readonly activeToolCalls = new Map<string, Set<string>>();
   private readonly toolTitles = new Map<string, string>();
+  private readonly sessionMessageIds = new Map<string, string>();
+  private readonly streamingSessions = new Set<string>();
 
   setTitle(toolCallId: string, title: string): void {
     this.toolTitles.set(toolCallId, title);
@@ -62,6 +65,32 @@ export class ToolCallTracker {
 
   getTitle(toolCallId: string): string | undefined {
     return this.toolTitles.get(toolCallId);
+  }
+
+  getOrCreateMessageId(sessionId: string): string {
+    let id = this.sessionMessageIds.get(sessionId);
+    if (!id) {
+      id = `msg_${randomUUID()}`;
+      this.sessionMessageIds.set(sessionId, id);
+    }
+    return id;
+  }
+
+  clearMessageId(sessionId: string): void {
+    this.sessionMessageIds.delete(sessionId);
+    this.streamingSessions.delete(sessionId);
+  }
+
+  isStreaming(sessionId: string): boolean {
+    return this.streamingSessions.has(sessionId);
+  }
+
+  setStreaming(sessionId: string, streaming: boolean): void {
+    if (streaming) {
+      this.streamingSessions.add(sessionId);
+    } else {
+      this.streamingSessions.delete(sessionId);
+    }
   }
 
   recordToolCall(sessionId: string, toolCallId: string): void {
@@ -95,6 +124,7 @@ export class ToolCallTracker {
 
   clearSession(sessionId: string): void {
     this.activeToolCalls.delete(sessionId);
+    this.clearMessageId(sessionId);
   }
 
   flushDangling(sessionId: string, exceptToolCallId?: string): AcpStreamMessage[] {
@@ -120,6 +150,8 @@ export class ToolCallTracker {
   dispose(): void {
     this.activeToolCalls.clear();
     this.toolTitles.clear();
+    this.sessionMessageIds.clear();
+    this.streamingSessions.clear();
   }
 }
 
@@ -180,11 +212,20 @@ function handleMessageChunk(
   sessionId: string,
   tracker: ToolCallTracker,
   msg: AcpStreamMessage,
+  update: SessionUpdatePayload,
 ): AcpStreamMessage[] {
-  if (tracker.hasActiveToolCalls(sessionId)) {
+  if (update.sessionUpdate === SESSION_UPDATES.AGENT_MESSAGE_CHUNK) {
+    if (!update.messageId) {
+      update.messageId = tracker.getOrCreateMessageId(sessionId);
+    }
+  }
+
+  if (tracker.hasActiveToolCalls(sessionId) && !tracker.isStreaming(sessionId)) {
     const completions = tracker.flushDangling(sessionId);
+    tracker.setStreaming(sessionId, true);
     return [...completions, msg];
   }
+  tracker.setStreaming(sessionId, true);
   return [msg];
 }
 
@@ -210,7 +251,7 @@ function processInbound(msg: AcpStreamMessage, tracker: ToolCallTracker): AcpStr
     kind === SESSION_UPDATES.AGENT_MESSAGE_CHUNK ||
     kind === SESSION_UPDATES.AGENT_THOUGHT_CHUNK
   ) {
-    return handleMessageChunk(sessionId, tracker, msg);
+    return handleMessageChunk(sessionId, tracker, msg, update);
   }
   return [msg];
 }
@@ -241,6 +282,7 @@ export function createDanglingToolCallsFix(): AcpFix & { tracker: ToolCallTracke
     },
 
     onTurnEnd(sessionId: string, _context: InboundContext): AcpStreamMessage[] {
+      tracker.clearMessageId(sessionId);
       return tracker.flushDangling(sessionId);
     },
 

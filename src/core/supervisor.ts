@@ -46,12 +46,12 @@ export {
 const DEFAULT_RECYCLE_TIMEOUT_MS = 60_000;
 const DEFAULT_RECYCLE_SPAWN_ATTEMPTS = 3;
 const DEFAULT_RECYCLE_RETRY_DELAY_MS = 500;
-const DEFAULT_PROMPT_SETTLE_TIMEOUT_MS = 1000;
+const DEFAULT_PROMPT_SETTLE_TIMEOUT_MS = 0;
 
 function parseEnvMs(val: string | undefined, defaultMs: number): number {
   if (!val) return defaultMs;
   const num = Number(val);
-  return Number.isFinite(num) && num > 0 ? num : defaultMs;
+  return Number.isFinite(num) && num >= 0 ? num : defaultMs;
 }
 
 function extractModeId(modeId?: string, meta?: unknown): string | undefined {
@@ -71,6 +71,19 @@ function isUsageUpdate(msg: AcpStreamMessage): boolean {
   if (!("method" in msg) || msg.method !== ACP_METHODS.SESSION_UPDATE) return false;
   const update = (msg.params as SessionUpdateParams | undefined)?.update;
   return update?.sessionUpdate === SESSION_UPDATES.USAGE_UPDATE;
+}
+
+function isNonTerminalActivity(msg: AcpStreamMessage): boolean {
+  if (!("method" in msg) || msg.method !== ACP_METHODS.SESSION_UPDATE) return false;
+  const update = (msg.params as SessionUpdateParams | undefined)?.update;
+  if (!update) return false;
+  const k = update.sessionUpdate;
+  return (
+    k === SESSION_UPDATES.TOOL_CALL ||
+    k === SESSION_UPDATES.TOOL_CALL_UPDATE ||
+    k === SESSION_UPDATES.AGENT_MESSAGE_CHUNK ||
+    k === SESSION_UPDATES.AGENT_THOUGHT_CHUNK
+  );
 }
 
 interface PendingInternalRequest {
@@ -554,6 +567,9 @@ export class ProcessSupervisor implements CoreContext {
   ): void {
     if (sessionId && isUsageUpdate(msg)) {
       this.armPromptSettlementWatchdog(sessionId);
+    }
+    if (sessionId && isNonTerminalActivity(msg)) {
+      this.clearPromptSettlementTimer(sessionId);
     }
     if ("result" in msg || "error" in msg) {
       this.clearActivePromptByMsg(msg);

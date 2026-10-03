@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AcpStreamMessage } from "../../core/types.js";
+import { setFixData } from "../../core/session-cache.js";
 import { createMockContext } from "../../test-utils/e2e-harness.js";
 import {
   DEFAULT_CANCELLATION_TIMEOUT_MS,
@@ -426,5 +427,71 @@ describe("interruptionCleanupFix", () => {
 
     const res = fix.onInbound?.(toolCallUpdate, mockCtx);
     expect(res).toEqual([toolCallUpdate]);
+  });
+
+  it("immediately aborts background subagents and settles prompt on session cancel when active tasks exist", async () => {
+    const fix = createCancellationLeakFix();
+    let recycledSession: unknown = null;
+    let forwardedInbound: AcpStreamMessage | null = null;
+
+    const session = {
+      sessionId: "sess-subagent-cancel",
+      lastConfigOptions: new Map(),
+      fixData: new Map(),
+    };
+    setFixData(session, "hadActiveTasksOnCancel", true);
+
+    const mockCtx = {
+      ...createMockContext(),
+      session,
+      triggerRecycle: async (sess: unknown) => {
+        recycledSession = sess;
+      },
+      forwardInbound: (msg: AcpStreamMessage) => {
+        forwardedInbound = msg;
+      },
+    };
+
+    const promptMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      id: 501,
+      method: "session/prompt",
+      params: {
+        sessionId: "sess-subagent-cancel",
+        prompt: [{ type: "text", text: "launch 14 subagents" }],
+      },
+    } as unknown as AcpStreamMessage;
+
+    await fix.onOutbound?.(promptMsg, mockCtx);
+
+    const cancelMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/cancel",
+      params: { sessionId: "sess-subagent-cancel" },
+    } as unknown as AcpStreamMessage;
+
+    const cancelResult = await fix.onOutbound?.(cancelMsg, mockCtx);
+
+    // Cancel must return null so outbound cancel is not sent down to recycled/dying child
+    expect(cancelResult).toBeNull();
+
+    // Must immediately forward cancelled prompt response to client UI
+    expect(forwardedInbound).toEqual({
+      jsonrpc: "2.0",
+      id: 501,
+      result: { stopReason: "cancelled" },
+    });
+
+    // Must trigger process recycle to kill all active subagent worker processes
+    expect(recycledSession).toBe(session);
+
+    // Late upstream prompt response must be suppressed
+    const lateUpstreamResponse: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      id: 501,
+      result: { stopReason: "end_turn" },
+    } as unknown as AcpStreamMessage;
+    const inboundRes = fix.onInbound?.(lateUpstreamResponse, mockCtx);
+    expect(inboundRes).toEqual([]);
   });
 });

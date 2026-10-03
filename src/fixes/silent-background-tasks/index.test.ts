@@ -7,11 +7,15 @@ import type {
 } from "../../core/types.js";
 import {
   createBackgroundTasksFix,
+  detectCompletedSubagentsInText,
   formatScheduleTask,
   formatSubagentContent,
   inferToolName,
+  parseSubagentStatusReports,
   parseSubagentsFromArgs,
+  reconstructPlanFromSteps,
   type PlanEntry,
+  type TrackedSubagentInfo,
 } from "./index.js";
 
 const dummyInboundContext = {} as InboundContext;
@@ -604,5 +608,520 @@ describe("formatScheduleTask", () => {
         Prompt: "Hourly health check",
       }),
     ).toBe("Recurring: Hourly health check (0 * * * *)");
+  });
+});
+
+describe("parseSubagentsFromArgs extended formats", () => {
+  it("parses subagents when Subagents is a JSON-stringified array", () => {
+    const raw = {
+      Subagents: JSON.stringify([
+        { Role: "Dex SA Fallback Implementer", TypeName: "self" },
+        { Role: "Argo Bootstrap Precedence Fixer", TypeName: "self" },
+      ]),
+    };
+    const parsed = parseSubagentsFromArgs(raw);
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]?.role).toBe("Dex SA Fallback Implementer");
+    expect(parsed[1]?.role).toBe("Argo Bootstrap Precedence Fixer");
+  });
+
+  it("parses subagents with lowercase properties", () => {
+    const raw = {
+      subagents: [{ role: "Worker", type: "research", prompt: "Do research" }],
+    };
+    const parsed = parseSubagentsFromArgs(raw);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.role).toBe("Worker");
+    expect(parsed[0]?.typeName).toBe("research");
+  });
+});
+
+describe("parseSubagentStatusReports", () => {
+  it("extracts subagent status array from manage_subagents text output", () => {
+    const rawOutput = `Created At: 2026-10-03T12:43:40+02:00
+You have 2 active subagent(s):
+[{"role":"Dex SA Fallback Implementer","type":"self","conversationId":"cid-1","state":"idle"},{"role":"Argo Fixer","type":"self","conversationId":"cid-2","state":"running"}]`;
+    const reports = parseSubagentStatusReports(rawOutput);
+    expect(reports).toHaveLength(2);
+    expect(reports[0]).toMatchObject({
+      role: "Dex SA Fallback Implementer",
+      conversationId: "cid-1",
+      state: "idle",
+    });
+    expect(reports[1]).toMatchObject({
+      role: "Argo Fixer",
+      conversationId: "cid-2",
+      state: "running",
+    });
+  });
+});
+
+describe("detectCompletedSubagentsInText", () => {
+  it("detects subagent completion by conversationId", () => {
+    const tracked: TrackedSubagentInfo[] = [
+      {
+        conversationId: "53d2148bebf9941451baa4ffdbb0bff4",
+        role: "Dex SA Fallback Implementer",
+        content: "Subagent: Dex SA Fallback Implementer",
+        status: "in_progress",
+      },
+    ];
+    const text = "Subagent 53d2148bebf9941451baa4ffdbb0bff4 has completed its tasks and gone idle.";
+    const completed = detectCompletedSubagentsInText(text, tracked);
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.role).toBe("Dex SA Fallback Implementer");
+  });
+
+  it("detects subagent completion by role", () => {
+    const tracked: TrackedSubagentInfo[] = [
+      {
+        role: "Node Repair & Interruption Engineer",
+        content: "Subagent: Node Repair & Interruption Engineer",
+        status: "in_progress",
+      },
+    ];
+    const text =
+      "The Node Repair & Interruption Engineer subagent has completed successfully with verified tests.";
+    const completed = detectCompletedSubagentsInText(text, tracked);
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.role).toBe("Node Repair & Interruption Engineer");
+  });
+
+  it("detects subagent completion by Item number", () => {
+    const tracked: TrackedSubagentInfo[] = [
+      {
+        prompt: "Task: Item 3 - Make computed registered-cells win over caller annotations",
+        role: "Argo Bootstrap Precedence Fixer",
+        content: "Subagent: Argo Bootstrap Precedence Fixer",
+        status: "in_progress",
+      },
+      {
+        prompt: "Task: Item 6 - Add node-problem-detector",
+        role: "Node Problem Detector Architect",
+        content: "Subagent: Node Problem Detector Architect",
+        status: "in_progress",
+      },
+    ];
+    const text = "Item 3 has completed successfully: In main.tf we fixed precedence.";
+    const completed = detectCompletedSubagentsInText(text, tracked);
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.role).toBe("Argo Bootstrap Precedence Fixer");
+  });
+});
+
+describe("subagent live lifecycle and plan updates", () => {
+  it("updates individual subagents to completed when manage_subagents reports idle", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "s-lifecycle-1";
+
+    // 1. Launch 2 subagents
+    const launchMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_sub_1",
+          name: "invoke_subagent",
+          rawInput: {
+            Subagents: [
+              { Role: "Dex SA Fallback Implementer", TypeName: "self" },
+              { Role: "Argo Bootstrap Precedence Fixer", TypeName: "self" },
+            ],
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    await fix.onInbound?.(launchMsg, dummyInboundContext);
+    expect(fix.tracker.getEntries(sessionId)).toEqual([
+      { content: "Subagent: Dex SA Fallback Implementer", priority: "high", status: "in_progress" },
+      {
+        content: "Subagent: Argo Bootstrap Precedence Fixer",
+        priority: "high",
+        status: "in_progress",
+      },
+    ]);
+
+    // 2. manage_subagents reports Dex SA Fallback Implementer is idle while Argo is running
+    const manageSubagentsMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_manage_1",
+          name: "manage_subagents",
+          status: "completed",
+          rawOutput: `You have 2 active subagent(s):
+[{"role":"Dex SA Fallback Implementer","type":"self","conversationId":"cid-1","state":"idle"},{"role":"Argo Bootstrap Precedence Fixer","type":"self","conversationId":"cid-2","state":"running"}]`,
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = (await fix.onInbound?.(
+      manageSubagentsMsg,
+      dummyInboundContext,
+    )) as AcpStreamMessage[];
+    expect(res).toHaveLength(2);
+    expect(res[1]).toEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Subagent: Dex SA Fallback Implementer",
+              priority: "high",
+              status: "completed",
+            },
+            {
+              content: "Subagent: Argo Bootstrap Precedence Fixer",
+              priority: "high",
+              status: "in_progress",
+            },
+          ],
+        },
+      },
+    });
+
+    // 3. Telemetry STATE_RUNNING does not prematurely complete unfinished subagent
+    const stderrCtx: StderrContext = { forwardInbound: () => {} } as unknown as StderrContext;
+    fix.onStderrLine?.(
+      `RAW WS MSG: {"trajectoryStateUpdate":{"trajectoryId":"${sessionId}","state":"STATE_RUNNING"}}`,
+      stderrCtx,
+    );
+    expect(fix.tracker.getEntries(sessionId)[1]?.status).toBe("in_progress");
+  });
+
+  it("updates individual subagents to completed when assistant streams completion text", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "s-lifecycle-2";
+
+    // 1. Launch subagent
+    const launchMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_sub_2",
+          name: "invoke_subagent",
+          rawInput: {
+            Subagents: [
+              {
+                Role: "Argo Bootstrap Precedence Fixer",
+                Prompt: "Task: Item 3 - Make computed registered-cells win",
+                TypeName: "self",
+              },
+            ],
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    await fix.onInbound?.(launchMsg, dummyInboundContext);
+    expect(fix.tracker.getEntries(sessionId)[0]?.status).toBe("in_progress");
+
+    // 2. Assistant streams text stating Item 3 has completed successfully
+    const textChunkMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: "Item 3 has completed successfully with all unit tests passing.",
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = (await fix.onInbound?.(textChunkMsg, dummyInboundContext)) as AcpStreamMessage[];
+    expect(res).toHaveLength(2);
+    expect(res[1]).toMatchObject({
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Subagent: Argo Bootstrap Precedence Fixer",
+              status: "completed",
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("suppresses polling and generic wait timers when subagents are active", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "s-timer-suppress";
+
+    // 1. Launch subagents
+    const launchMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_sub_3",
+          name: "invoke_subagent",
+          rawInput: {
+            Subagents: [{ Role: "Worker", TypeName: "self" }],
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    await fix.onInbound?.(launchMsg, dummyInboundContext);
+    expect(fix.tracker.getEntries(sessionId)).toHaveLength(1);
+
+    // 2. Polling timer called while subagents are running
+    const pollScheduleMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_poll_1",
+          name: "schedule",
+          rawInput: {
+            DurationSeconds: 30,
+            Prompt: "Check on subagent progress",
+            TimerCondition: "any",
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = (await fix.onInbound?.(pollScheduleMsg, dummyInboundContext)) as AcpStreamMessage[];
+    // Should NOT emit a new plan message or pollute with Timer!
+    expect(res).toHaveLength(1);
+    expect(res[0]).toBe(pollScheduleMsg);
+    // Task entries remain only the subagent
+    expect(fix.tracker.getEntries(sessionId)).toHaveLength(1);
+    expect(fix.tracker.getEntries(sessionId)[0]?.content).toBe("Subagent: Worker");
+  });
+
+  it("suppresses generic timer calls with no description even when no subagents are running", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "s-generic-timer";
+
+    const genericTimerMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_wait_1",
+          name: "schedule",
+          rawInput: {
+            DurationSeconds: 60,
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = (await fix.onInbound?.(genericTimerMsg, dummyInboundContext)) as AcpStreamMessage[];
+    expect(res).toHaveLength(1);
+    expect(res[0]).toBe(genericTimerMsg);
+    expect(fix.tracker.getEntries(sessionId)).toHaveLength(0);
+  });
+});
+
+describe("reconstructPlanFromSteps", () => {
+  it("reconstructs completed subagent plan entries from historical tool call steps", () => {
+    const steps = [
+      {
+        kind: "tool_call",
+        name: "invoke_subagent",
+        rawInputJson: JSON.stringify({
+          Subagents: [
+            { Role: "Dex SA Fallback Implementer" },
+            { Role: "Argo Bootstrap Precedence Fixer" },
+          ],
+        }),
+      },
+      {
+        kind: "tool_call",
+        name: "run_command",
+        rawInputJson: JSON.stringify({ CommandLine: "git status" }),
+      },
+      {
+        kind: "assistant",
+        text: "I have launched `mise run check` in the background (task `task-2216`) to verify all repo quality gates.",
+      },
+    ];
+
+    const plan = reconstructPlanFromSteps(steps);
+    expect(plan).toEqual([
+      { content: "Subagent: Dex SA Fallback Implementer", priority: "high", status: "completed" },
+      {
+        content: "Subagent: Argo Bootstrap Precedence Fixer",
+        priority: "high",
+        status: "completed",
+      },
+      {
+        content: "Background task: mise run check",
+        priority: "high",
+        status: "completed",
+      },
+    ]);
+  });
+});
+
+describe("Background task tracking via content blocks and assistant announcements", () => {
+  it("detects background task from standard ACP content array in tool_call_update", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "sess_content_bg";
+
+    const toolCallMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_cmd_1",
+          name: "run_command",
+          rawInput: {
+            CommandLine: "mise run check",
+            toolSummary: "Mise run check",
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+    await fix.onInbound?.(toolCallMsg, dummyInboundContext);
+
+    const bgUpdateMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_cmd_1",
+          status: "completed",
+          content: [
+            {
+              type: "text",
+              text: "Created At: 2026-10-03T13:14:42+02:00\nTool is running as a background task with task id: sess_content_bg/task-2216\nTask Description: mise run check\nTask logs are available at: ...",
+            },
+          ],
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = (await fix.onInbound?.(bgUpdateMsg, dummyInboundContext)) as AcpStreamMessage[];
+    expect(res).toHaveLength(2);
+    expect(res[1]).toEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Background task: mise run check",
+              priority: "high",
+              status: "in_progress",
+            },
+          ],
+        },
+      },
+    });
+
+    // When task finishes with result, match by taskId and mark completed
+    const completionMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: 'Task id "sess_content_bg/task-2216" finished with result:\nThe command exited with code 0.',
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const compRes = (await fix.onInbound?.(
+      completionMsg,
+      dummyInboundContext,
+    )) as AcpStreamMessage[];
+    expect(compRes).toHaveLength(2);
+    expect(compRes[1]).toEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Background task: mise run check",
+              priority: "high",
+              status: "completed",
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("detects launched background task from assistant streaming announcement", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "sess_announce_bg";
+
+    const announceMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: "I have launched `mise run check` in the background (task `task-2216`) to verify all repo quality gates.",
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = (await fix.onInbound?.(announceMsg, dummyInboundContext)) as AcpStreamMessage[];
+    expect(res).toHaveLength(2);
+    expect(res[1]).toEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Background task: mise run check",
+              priority: "high",
+              status: "in_progress",
+            },
+          ],
+        },
+      },
+    });
   });
 });

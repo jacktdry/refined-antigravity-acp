@@ -378,6 +378,127 @@ describe("ProcessSupervisor", () => {
     supervisor.close();
   });
 
+  it("solution: prompt settlement watchdog is cleared when tool call activity arrives after usage_update", async () => {
+    const { child } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline([]),
+      promptSettlementTimeoutMs: 50,
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    // Client sends prompt
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 104,
+      method: ACP_METHODS.SESSION_PROMPT,
+      params: { sessionId: "session-4", prompt: [] },
+    } as unknown as AcpStreamMessage);
+
+    // Upstream emits usage_update
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "session-4",
+          update: { sessionUpdate: SESSION_UPDATES.USAGE_UPDATE, used: 100, size: 1000 },
+        },
+      }),
+    );
+
+    // Upstream emits tool call (active execution started)
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "session-4",
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+            toolCallId: "call-1",
+            name: "run_command",
+          },
+        },
+      }),
+    );
+
+    // Wait beyond the watchdog timeout
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Watchdog should NOT have fired end_turn because active tool execution cleared the watchdog
+    const syntheticResponses = forwarded.filter((m) => "id" in m && m.id === 104 && "result" in m);
+    expect(syntheticResponses).toHaveLength(0);
+
+    await reader.cancel();
+    supervisor.close();
+  });
+
+  it("solution: prompt settlement watchdog is disabled by default", async () => {
+    const { child } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline([]),
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    // Client sends prompt
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 105,
+      method: ACP_METHODS.SESSION_PROMPT,
+      params: { sessionId: "session-5", prompt: [] },
+    } as unknown as AcpStreamMessage);
+
+    // Upstream emits usage_update
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "session-5",
+          update: { sessionUpdate: SESSION_UPDATES.USAGE_UPDATE, used: 100, size: 1000 },
+        },
+      }),
+    );
+
+    // Wait 50ms
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // No synthetic end_turn should be emitted by default
+    const syntheticResponses = forwarded.filter((m) => "id" in m && m.id === 105 && "result" in m);
+    expect(syntheticResponses).toHaveLength(0);
+
+    await reader.cancel();
+    supervisor.close();
+  });
+
   it("keeps session metadata when an upstream lifecycle request fails", async () => {
     const { child } = createMockChild();
     const supervisor = new ProcessSupervisor({

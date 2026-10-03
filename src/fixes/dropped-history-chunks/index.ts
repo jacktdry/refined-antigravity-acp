@@ -33,6 +33,10 @@ import { stripSteeringPrefix } from "../active-turn-collision/index.js";
 import { stripSystemContext } from "../missing-system-prompt/index.js";
 import { sanitizeText } from "../malformed-stream-syntax/index.js";
 import { decodeVarint, getField } from "../../lib/protobuf.js";
+import {
+  createPlanUpdateMessage,
+  reconstructPlanFromSteps,
+} from "../silent-background-tasks/index.js";
 
 export { decodeVarint, getField };
 
@@ -258,7 +262,12 @@ export function synthesizeReplayUpdates(
   sessionId: string,
   steps: readonly ConversationStep[],
 ): AcpStreamMessage[] {
-  return steps.flatMap((s) => synthesizeStepUpdates(sessionId, s));
+  const updates = steps.flatMap((s) => synthesizeStepUpdates(sessionId, s));
+  const planEntries = reconstructPlanFromSteps(steps);
+  if (planEntries.length > 0) {
+    updates.push(createPlanUpdateMessage(sessionId, planEntries));
+  }
+  return updates;
 }
 
 const pendingReplayLoads = new Map<string | number, string>();

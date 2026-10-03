@@ -24,8 +24,14 @@ import {
   type InboundContext,
   type OutboundContext,
   type SessionUpdateParams,
+  type CachedSessionMetadata,
 } from "../../core/types.js";
-import { extractSessionId, getSession, getOrCreateSession } from "../../core/session-cache.js";
+import {
+  extractSessionId,
+  getSession,
+  getOrCreateSession,
+  getFixData,
+} from "../../core/session-cache.js";
 
 export const CANCELLATION_ERROR_REGEX =
   /^(?:context\s+canceled)?\s*The\s+request\s+was\s+cancelled\s+by\s+the\s+client\.?$/i;
@@ -110,46 +116,93 @@ async function handleOutboundPrompt(
   }
 }
 
-function handleOutboundCancel(
-  msg: AcpStreamMessage,
+function handleImmediateTaskCancellation(
+  promptId: string | number,
+  session: CachedSessionMetadata | undefined,
+  context: OutboundContext,
+  state: CancellationState,
+  sessionId: string,
+): void {
+  const targetSession =
+    session ??
+    (context.sessionCache ? getOrCreateSession(context.sessionCache, sessionId) : undefined);
+  if (targetSession) {
+    targetSession.needsRecycle = true;
+  }
+  state.suppressedLateResponseIds.add(promptId);
+  const alreadySettled = getFixData<string | number>(session, "cancelPromptSettled");
+  if (alreadySettled !== promptId) {
+    const cancelResponse: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      id: promptId,
+      result: { stopReason: STOP_REASONS.CANCELLED },
+    };
+    context.forwardInbound?.(cancelResponse);
+  }
+  if (targetSession) {
+    void context.triggerRecycle?.(targetSession);
+  }
+}
+
+function handleCancellationTimeout(
+  sessionId: string,
+  promptId: string | number,
+  context: OutboundContext,
+  state: CancellationState,
+  resolveFn: () => void,
+): void {
+  const current = state.cancellingSessions.get(sessionId);
+  if (!current || current.promptId !== promptId) return;
+
+  state.cancellingSessions.delete(sessionId);
+  state.suppressedLateResponseIds.add(promptId);
+  const targetSession =
+    context.session ??
+    (context.sessionCache ? getOrCreateSession(context.sessionCache, sessionId) : undefined);
+  if (targetSession) {
+    targetSession.needsRecycle = true;
+  }
+  const cancelResponse: AcpStreamMessage = {
+    jsonrpc: "2.0",
+    id: promptId,
+    result: { stopReason: STOP_REASONS.CANCELLED },
+  };
+  context.forwardInbound?.(cancelResponse);
+  resolveFn();
+  if (targetSession) {
+    void context.triggerRecycle?.(targetSession);
+  }
+}
+
+function resolveActivePromptId(
+  sessionId: string,
+  session: CachedSessionMetadata | undefined,
+  state: CancellationState,
+): string | number | undefined {
+  const promptId = state.activePrompts.get(sessionId) ?? session?.activePromptId;
+  if (promptId !== undefined) {
+    state.activePrompts.delete(sessionId);
+    if (session) {
+      session.activePromptId = undefined;
+    }
+  }
+  return promptId;
+}
+
+function scheduleCancellationTimeout(
+  sessionId: string,
+  promptId: string | number,
   context: OutboundContext,
   state: CancellationState,
   timeoutMs: number,
 ): void {
-  const sessionId = extractSessionId(msg);
-  if (!sessionId) return;
-
-  const session = context.session ?? getSession(context.sessionCache, sessionId);
-  const promptId = state.activePrompts.get(sessionId) ?? session?.activePromptId;
-  if (promptId === undefined) return;
-
-  state.activePrompts.delete(sessionId);
-  if (session) {
-    session.activePromptId = undefined;
-  }
-  if (state.cancellingSessions.has(sessionId)) return;
-
   let resolveFn!: () => void;
   const promise = new Promise<void>((resolve) => {
     resolveFn = resolve;
   });
 
   const timer = setTimeout(() => {
-    const current = state.cancellingSessions.get(sessionId);
-    if (current && current.promptId === promptId) {
-      state.cancellingSessions.delete(sessionId);
-      state.suppressedLateResponseIds.add(promptId);
-      const targetSession = context.session ?? getOrCreateSession(context.sessionCache, sessionId);
-      targetSession.needsRecycle = true;
-      const cancelResponse: AcpStreamMessage = {
-        jsonrpc: "2.0",
-        id: promptId,
-        result: { stopReason: STOP_REASONS.CANCELLED },
-      };
-      context.forwardInbound?.(cancelResponse);
-      resolveFn();
-      void context.triggerRecycle?.(targetSession);
-    }
+    handleCancellationTimeout(sessionId, promptId, context, state, resolveFn);
   }, timeoutMs);
   timer.unref?.();
 
@@ -159,6 +212,32 @@ function handleOutboundCancel(
     promise,
     resolve: resolveFn,
   });
+}
+
+function handleOutboundCancel(
+  msg: AcpStreamMessage,
+  context: OutboundContext,
+  state: CancellationState,
+  timeoutMs: number,
+): boolean {
+  const sessionId = extractSessionId(msg);
+  if (!sessionId) return false;
+
+  const session =
+    context.session ??
+    (context.sessionCache ? getSession(context.sessionCache, sessionId) : undefined);
+  const promptId = resolveActivePromptId(sessionId, session, state);
+  if (promptId === undefined || state.cancellingSessions.has(sessionId)) return false;
+
+  const hadActiveTasks =
+    getFixData<boolean>(session, "hadActiveTasksOnCancel") || Boolean(session?.needsRecycle);
+  if (hadActiveTasks) {
+    handleImmediateTaskCancellation(promptId, session, context, state, sessionId);
+    return true;
+  }
+
+  scheduleCancellationTimeout(sessionId, promptId, context, state, timeoutMs);
+  return false;
 }
 
 function handleInboundPromptId(
@@ -222,11 +301,17 @@ export function createCancellationLeakFix(options?: CancellationOptions): AcpFix
     description:
       "Suppresses raw upstream Go/Python cancellation error chunks and ensures prompt settlement during client interruptions",
 
-    async onOutbound(msg: AcpStreamMessage, context: OutboundContext): Promise<AcpStreamMessage> {
+    async onOutbound(
+      msg: AcpStreamMessage,
+      context: OutboundContext,
+    ): Promise<AcpStreamMessage | null> {
       if (isMethod(msg, ACP_METHODS.SESSION_PROMPT)) {
         await handleOutboundPrompt(msg, context, state);
       } else if (isMethod(msg, ACP_METHODS.SESSION_CANCEL)) {
-        handleOutboundCancel(msg, context, state, timeoutMs);
+        const fastCancelled = handleOutboundCancel(msg, context, state, timeoutMs);
+        if (fastCancelled) {
+          return null;
+        }
       }
       return msg;
     },

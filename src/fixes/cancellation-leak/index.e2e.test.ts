@@ -222,4 +222,46 @@ describe("cancellation-leak e2e", () => {
     console.log("Terminal tool updates received by client:", toolUpdates.length);
     expect(toolUpdates.length).toBeGreaterThan(0);
   }, 60000);
+
+  it("solution: wrapped connector cancels active subagent task immediately and returns cancelled stopReason", async () => {
+    const client = await spawnWrapped();
+    activeClients.push(client);
+    await client.initialize();
+    const { sessionId } = await client.newSession({ modeId: "yolo" });
+
+    // Send a prompt to invoke a subagent
+    const p1 = await client.prompt(
+      sessionId,
+      'Use invoke_subagent to launch a subagent with Role: "Research Agent" and Prompt: "Search the codebase for exports"',
+    );
+
+    // Wait until invoke_subagent arrives or starts
+    await client.nextMatching(
+      (m) =>
+        ("method" in m &&
+          m.method === "session/update" &&
+          (m.params as { update?: { sessionUpdate?: string } })?.update?.sessionUpdate ===
+            "plan") ||
+        ("method" in m &&
+          m.method === "session/update" &&
+          (m.params as { update?: { sessionUpdate?: string } })?.update?.sessionUpdate ===
+            "tool_call"),
+      30000,
+    );
+
+    const t0 = Date.now();
+    await client.send({
+      jsonrpc: "2.0",
+      method: "session/cancel",
+      params: { sessionId },
+    } as unknown as AcpStreamMessage);
+
+    // Prompt response must settle as cancelled immediately
+    const res1 = await client.waitForResponse(p1.id, 2000);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(2000);
+    expect("result" in res1 && (res1.result as { stopReason?: string }).stopReason).toBe(
+      "cancelled",
+    );
+  }, 60000);
 });

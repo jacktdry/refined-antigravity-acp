@@ -377,4 +377,111 @@ describe("ProcessSupervisor", () => {
     await reader.cancel();
     supervisor.close();
   });
+
+  it("keeps session metadata when an upstream lifecycle request fails", async () => {
+    const { child } = createMockChild();
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline([]),
+    });
+    getOrCreateSession(supervisor.sessionCache, "session-delete");
+
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 201,
+      method: ACP_METHODS.SESSION_DELETE,
+      params: { sessionId: "session-delete" },
+    } as unknown as AcpStreamMessage);
+
+    expect(supervisor.sessionCache.sessions.has("session-delete")).toBe(true);
+
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 201,
+        error: { code: -32601, message: "Method not found" },
+      }),
+    );
+
+    expect(supervisor.sessionCache.sessions.has("session-delete")).toBe(true);
+    supervisor.close();
+  });
+
+  it("removes session metadata only after a successful close response", async () => {
+    const { child } = createMockChild();
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline([]),
+    });
+    getOrCreateSession(supervisor.sessionCache, "session-close");
+    getOrCreateSession(supervisor.sessionCache, "session-keep");
+
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 202,
+      method: ACP_METHODS.SESSION_CLOSE,
+      params: { sessionId: "session-close" },
+    } as unknown as AcpStreamMessage);
+
+    expect(supervisor.sessionCache.sessions.has("session-close")).toBe(true);
+
+    await supervisor.handleStdoutLine(JSON.stringify({ jsonrpc: "2.0", id: 202, result: {} }));
+
+    expect(supervisor.sessionCache.sessions.has("session-close")).toBe(false);
+    expect(supervisor.sessionCache.sessions.has("session-keep")).toBe(true);
+    supervisor.close();
+  });
+
+  it("recycles the upstream child after the last session closes", async () => {
+    const { child: initialChild } = createMockChild();
+    const { child: recycledChild } = createMockChild();
+    let spawnCount = 0;
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild,
+      pipeline: new AcpPipeline([]),
+      spawnProcess: () => {
+        spawnCount += 1;
+        return recycledChild;
+      },
+    });
+    supervisor.sessionCache.cachedInitializeParams = {
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "test-client", version: "1" },
+    };
+    getOrCreateSession(supervisor.sessionCache, "session-last");
+
+    recycledChild.stdin?.on("data", (chunk: Buffer) => {
+      const lines = chunk.toString("utf-8").split("\n").filter(Boolean);
+      for (const line of lines) {
+        const msg = JSON.parse(line) as { id?: string | number };
+        if (msg.id === "__refined_agy_recycle_init") {
+          void supervisor.handleStdoutLine(
+            JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }),
+          );
+        }
+      }
+    });
+
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 203,
+      method: ACP_METHODS.SESSION_CLOSE,
+      params: { sessionId: "session-last" },
+    } as unknown as AcpStreamMessage);
+
+    await supervisor.handleStdoutLine(JSON.stringify({ jsonrpc: "2.0", id: 203, result: {} }));
+
+    expect(supervisor.sessionCache.sessions.size).toBe(0);
+    expect(initialChild.killed).toBe(true);
+    expect(supervisor.currentChild).toBe(recycledChild);
+    expect(spawnCount).toBe(1);
+    supervisor.close();
+  });
 });

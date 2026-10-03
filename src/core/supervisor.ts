@@ -79,6 +79,11 @@ interface PendingInternalRequest {
   timer: NodeJS.Timeout;
 }
 
+interface PendingSessionLifecycle {
+  method: typeof ACP_METHODS.SESSION_CLOSE | typeof ACP_METHODS.SESSION_DELETE;
+  sessionId: string;
+}
+
 export interface SupervisorOptions {
   cmd: string;
   args: string[];
@@ -116,6 +121,7 @@ export class ProcessSupervisor implements CoreContext {
   private readonly promptSettlementTimers = new Map<string, NodeJS.Timeout>();
   private readonly activePrompts = new Map<string, string | number>();
   private readonly pendingRequests = new Map<string | number, PendingInternalRequest>();
+  private readonly pendingSessionLifecycle = new Map<string | number, PendingSessionLifecycle>();
   private readonly suppressedResponseIds = new Set<string | number>();
   private activeRecycle: Promise<void> | null = null;
   private rlOut: readline.Interface | null = null;
@@ -418,16 +424,35 @@ export class ProcessSupervisor implements CoreContext {
     }
   }
 
-  private handleSessionLifecycleMetadata(msg: AcpStreamMessage): void {
-    if (!("method" in msg)) return;
-    const isClose = msg.method === ACP_METHODS.SESSION_CLOSE;
-    const isDelete = msg.method === ACP_METHODS.SESSION_DELETE;
-    if (!isClose && !isDelete) return;
+  private recordOutboundSessionLifecycle(msg: AcpStreamMessage): void {
+    if (!("method" in msg) || !("id" in msg) || msg.id === null || msg.id === undefined) return;
+    if (msg.method !== ACP_METHODS.SESSION_CLOSE && msg.method !== ACP_METHODS.SESSION_DELETE)
+      return;
     const p = (msg as { params?: { sessionId?: string } }).params;
-    if (p?.sessionId) {
-      this.clearPromptSettlementTimer(p.sessionId);
-      this.activePrompts.delete(p.sessionId);
-      this.sessionCache.sessions.delete(p.sessionId);
+    if (!p?.sessionId) return;
+    this.pendingSessionLifecycle.set(msg.id, { method: msg.method, sessionId: p.sessionId });
+  }
+
+  private async commitInboundSessionLifecycle(msg: AcpStreamMessage): Promise<void> {
+    if (!isJsonRpcResponse(msg)) return;
+    const pending = this.pendingSessionLifecycle.get(msg.id);
+    if (!pending) return;
+    this.pendingSessionLifecycle.delete(msg.id);
+
+    if ("error" in msg && msg.error) {
+      return;
+    }
+
+    this.clearPromptSettlementTimer(pending.sessionId);
+    this.activePrompts.delete(pending.sessionId);
+    this.sessionCache.sessions.delete(pending.sessionId);
+
+    if (
+      pending.method === ACP_METHODS.SESSION_CLOSE &&
+      this.sessionCache.sessions.size === 0 &&
+      !this.isClosed
+    ) {
+      await this.triggerIdleRecycle();
     }
   }
 
@@ -459,8 +484,8 @@ export class ProcessSupervisor implements CoreContext {
       [ACP_METHODS.SESSION_CANCEL]: (m) => this.recordOutboundCancel(m),
       [ACP_METHODS.SESSION_SET_MODE]: (m) => this.recordOutboundSetMode(m),
       [ACP_METHODS.SESSION_SET_CONFIG_OPTION]: (m) => this.recordOutboundSetConfigOption(m),
-      [ACP_METHODS.SESSION_CLOSE]: (m) => this.handleSessionLifecycleMetadata(m),
-      [ACP_METHODS.SESSION_DELETE]: (m) => this.handleSessionLifecycleMetadata(m),
+      [ACP_METHODS.SESSION_CLOSE]: (m) => this.recordOutboundSessionLifecycle(m),
+      [ACP_METHODS.SESSION_DELETE]: (m) => this.recordOutboundSessionLifecycle(m),
     };
     handlers[msg.method]?.(msg);
   }
@@ -578,6 +603,7 @@ export class ProcessSupervisor implements CoreContext {
 
     const context = this.createContext(session, undefined, this.isRecycling);
     await this.dispatchInboundPipeline(msg, sessionId, context);
+    await this.commitInboundSessionLifecycle(msg);
   }
 
   handleStderrLine(line: string): void {
@@ -613,6 +639,7 @@ export class ProcessSupervisor implements CoreContext {
       pending.reject(error);
     }
     this.pendingRequests.clear();
+    this.pendingSessionLifecycle.clear();
     this.suppressedResponseIds.clear();
     clearPendingRequestSessions(this.sessionCache);
   }
@@ -698,22 +725,99 @@ export class ProcessSupervisor implements CoreContext {
     }
   }
 
-  private async performResync(
-    session: CachedSessionMetadata,
-    newChild: ChildProcess,
-  ): Promise<void> {
+  private async triggerIdleRecycle(): Promise<void> {
+    if (this.activeRecycle) {
+      await this.activeRecycle;
+      return;
+    }
+    this.activeRecycle = this.recycleIdleProcess();
+    try {
+      await this.activeRecycle;
+    } finally {
+      this.activeRecycle = null;
+    }
+  }
+
+  private async initializeRecycledChild(): Promise<void> {
     const initParams = this.sessionCache.cachedInitializeParams ?? {
       protocolVersion: 1,
       clientCapabilities: {},
       clientInfo: { name: "refined-antigravity-acp", version: "0.2.0" },
     };
-
     await this.sendInternalRequest({
       jsonrpc: "2.0",
       id: RECYCLE_INIT_ID,
-      method: "initialize",
+      method: ACP_METHODS.INITIALIZE,
       params: initParams,
     } as unknown as AcpStreamMessage);
+  }
+
+  private async recycleIdleProcess(): Promise<void> {
+    this.isRecycling = true;
+
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= this.recycleSpawnAttempts; attempt++) {
+      this.cleanupOldChild();
+      try {
+        const newChild = await this.spawnFn(this.cmd, this.args);
+        this.currentChild = newChild;
+        this.bindChild(newChild);
+        await this.initializeRecycledChild();
+        this.isRecycling = false;
+        return;
+      } catch (err) {
+        lastErr = err;
+        const attemptsLeft = this.recycleSpawnAttempts - attempt;
+        console.error(
+          "[refined-antigravity-acp] Idle process recycle attempt " +
+            attempt +
+            "/" +
+            this.recycleSpawnAttempts +
+            " failed" +
+            (attemptsLeft > 0
+              ? "; retrying in " +
+                this.recycleRetryDelayMs +
+                "ms (" +
+                attemptsLeft +
+                " attempt(s) left):"
+              : ", no attempts left:"),
+          err,
+        );
+        if (attemptsLeft > 0) {
+          await delay(this.recycleRetryDelayMs);
+        }
+      }
+    }
+
+    this.isRecycling = false;
+    this.failIdleRecycle(lastErr);
+  }
+
+  private failIdleRecycle(err: unknown): never {
+    this.isClosed = true;
+    this.pipeline.dispose();
+    this.rlErr?.close();
+    this.rlOut?.close();
+    if (this.currentChild && !this.currentChild.killed) {
+      this.currentChild.kill("SIGKILL");
+    }
+    const reason = err instanceof Error ? err.message : String(err);
+    const failure = new Error(
+      "[refined-antigravity-acp] Idle process recycle failed after " +
+        this.recycleSpawnAttempts +
+        " attempt(s): " +
+        reason,
+    );
+    this.rejectPendingRequests(failure);
+    this.closeController(failure);
+    throw failure;
+  }
+
+  private async performResync(
+    session: CachedSessionMetadata,
+    newChild: ChildProcess,
+  ): Promise<void> {
+    await this.initializeRecycledChild();
 
     await this.pipeline.applyRecycle(session, newChild, this);
     const context = this.createContext(session);

@@ -1,5 +1,6 @@
 import type { AcpFix } from "../core/types.js";
 import { missingLocalharnessFix } from "./missing-localharness/index.js";
+import { missingSessionCloseFix } from "./missing-session-close/index.js";
 import { missingSystemPromptFix } from "./missing-system-prompt/index.js";
 import { missingSlashSkillsFix } from "./missing-slash-skills/index.js";
 import { subagentHangFix } from "./subagent-hang/index.js";
@@ -19,6 +20,7 @@ import { prematureTurnStopFix } from "./premature-turn-stop/index.js";
 import { repetitiveToolLoopFix } from "./repetitive-tool-loop/index.js";
 
 export * from "./missing-localharness/index.js";
+export * from "./missing-session-close/index.js";
 export * from "./missing-system-prompt/index.js";
 export * from "./missing-slash-skills/index.js";
 export * from "./subagent-hang/index.js";
@@ -46,6 +48,7 @@ export * from "./repetitive-tool-loop/index.js";
 export function createDefaultFixes(): AcpFix[] {
   return [
     missingLocalharnessFix,
+    missingSessionCloseFix,
     missingSystemPromptFix,
     missingSlashSkillsFix,
     subagentHangFix,
